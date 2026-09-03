@@ -44,6 +44,7 @@ milestone — methods in that domain currently raise NotImplemented.
 from __future__ import annotations
 
 import itertools
+import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from cdp_use import CDPClient
@@ -165,9 +166,11 @@ class BidiCdpProxy(CDPClient):
 
 		self._nodes = NodeRegistry()
 		self._started = False
-		# Cached single-pass DOM scan (tree + flattened snapshot), keyed by URL.
+		# Cached single-pass DOM scan (tree + flattened snapshot). TTL-based so
+		# SPA pages (URL never changes) still re-scan between agent steps.
 		self._scan_cache: Optional[dict] = None
 		self._scan_url: Optional[str] = None
+		self._scan_monotonic: float = 0.0
 
 	# ── page access ─────────────────────────────────────────────────────
 	@property
@@ -409,6 +412,11 @@ class BidiCdpProxy(CDPClient):
 		return {}
 
 	# ── DOM / DOMSnapshot (OBSERVE — the synthetic node-identity core) ───
+	# Keep DOM.getDocument + DOMSnapshot.captureSnapshot consistent within one
+	# observation, but force a fresh scan on the next agent step so SPA
+	# re-renders (Ashby etc., URL unchanged) are visible and __buid ids stay live.
+	_SCAN_TTL_S = 1.0
+
 	async def _dom_scan(self) -> dict:
 		"""Single source of truth for the DOM tree + flattened snapshot.
 
@@ -416,21 +424,29 @@ class BidiCdpProxy(CDPClient):
 		``__buid`` (persisted on ``window.__buNext`` so a backendNodeId is
 		identical across DOM.getDocument / DOMSnapshot.captureSnapshot /
 		DOM.describeNode), and returns BOTH the CDP node tree and the
-		flattened snapshot. Cached per page URL; re-scanned on navigation.
+		flattened snapshot. Cached briefly (TTL); re-scanned on navigation
+		or after the TTL expires.
 		"""
 		from browser_use.dom.enhanced_snapshot import REQUIRED_COMPUTED_STYLES
 
 		url = self._safe_url()
-		if self._scan_cache is not None and self._scan_url == url:
+		now = time.monotonic()
+		if (
+			self._scan_cache is not None
+			and self._scan_url == url
+			and now - self._scan_monotonic < self._SCAN_TTL_S
+		):
 			return self._scan_cache
 		scan = await self._page.evaluate(_DOM_SCAN_JS, REQUIRED_COMPUTED_STYLES)
 		self._scan_cache = scan
 		self._scan_url = url
+		self._scan_monotonic = now
 		return scan
 
 	def _invalidate_scan(self) -> None:
 		self._scan_cache = None
 		self._scan_url = None
+		self._scan_monotonic = 0.0
 
 	async def _DOM_getDocument(self, params: dict, session_id: Optional[str]) -> dict:
 		scan = await self._dom_scan()
@@ -456,6 +472,50 @@ class BidiCdpProxy(CDPClient):
 		elif backend is not None:
 			buid = backend
 		return {'node': {'backendNodeId': buid, 'nodeId': buid}}
+
+	async def _DOM_setFileInputFiles(self, params: dict, session_id: Optional[str]) -> dict:
+		"""Translate CDP DOM.setFileInputFiles → Playwright set_input_files.
+
+		Resolves the element by ``__buid`` (backendNodeId), finds the nearest
+		``input[type=file]``, and uploads the real file paths. Without this,
+		``upload_file`` raises CdpMethodNotImplemented and agents fall back to
+		faking a File via JS DataTransfer (corrupt uploads + spam signals).
+		"""
+		files = params.get('files') or []
+		backend = params.get('backendNodeId')
+		handle = await self._page.evaluate_handle(
+			"""(id) => {
+				const walk = (root) => {
+					for (const el of root.querySelectorAll('*')) {
+						if (el.__buid === id) return el;
+						if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r) return r; }
+					}
+					return null;
+				};
+				let el = walk(document);
+				if (!el) return null;
+				if (el.matches && el.matches('input[type="file"]')) return el;
+				if (el.querySelector) {
+					const d = el.querySelector('input[type="file"]');
+					if (d) return d;
+				}
+				let cur = el;
+				for (let i = 0; i < 5 && cur; i++) {
+					cur = cur.parentElement;
+					if (cur) {
+						const d = cur.querySelector('input[type="file"]');
+						if (d) return d;
+					}
+				}
+				return el;
+			}""",
+			backend,
+		)
+		el = handle.as_element()
+		if el is None:
+			raise RuntimeError(f'setFileInputFiles: no element found for backendNodeId={backend}')
+		await el.set_input_files(files)
+		return {}
 
 	# ── Accessibility ───────────────────────────────────────────────────
 	async def _Accessibility_getFullAXTree(self, params: dict, session_id: Optional[str]) -> dict:
@@ -549,6 +609,7 @@ class BidiCdpProxy(CDPClient):
 		# DOM / DOMSnapshot / Accessibility (OBSERVE)
 		'DOM.getDocument': _DOM_getDocument,
 		'DOM.describeNode': _DOM_describeNode,
+		'DOM.setFileInputFiles': _DOM_setFileInputFiles,
 		'DOMSnapshot.captureSnapshot': _DOMSnapshot_captureSnapshot,
 		'Accessibility.getFullAXTree': _Accessibility_getFullAXTree,
 		# Input

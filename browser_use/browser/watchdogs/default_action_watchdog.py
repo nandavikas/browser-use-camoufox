@@ -3866,28 +3866,36 @@ class DefaultActionWatchdog(BaseWatchdog):
 			self.logger.debug(f'🖱️ (BiDi) Clicked {element_node.node_name} (buid={getattr(element_node, "backend_node_id", None)})')
 			return None
 		except Exception as e1:
-			# 2) Actionability timeout (lazy-loaded skeleton, covered by an
-			# overlay, zero-size wrapper — very common on SPA result pages like
-			# eBay). Force a JS click that bypasses the actionability checks —
-			# this mirrors the CDP path's `el.click()` fallback and stops the
-			# agent from looping on the same un-clickable index (the "chat hangs"
-			# symptom). Try the element, then its nearest <a>/[role=link] ancestor.
+			# 2) Force click — bypasses hit-target checks (Ashby overlays an
+			# invisible input over custom checkbox SVGs → "intercepts pointer
+			# events") but still dispatches TRUSTED browser events. Prefer this
+			# over untrusted JS click for anti-bot scoring.
 			try:
-				# Bound it too — on a stalled page even the JS click can block.
+				await target.click(timeout=1_500, force=True)
+				self.logger.info(
+					f'🖱️ (BiDi) Force-clicked {element_node.node_name} after actionability timeout'
+				)
+				return None
+			except Exception:
+				pass
+			# 3) Last resort: JS click. SVGElement has no .click() — use a
+			# MouseEvent for those, and climb to a / button / label ancestors.
+			try:
 				await asyncio.wait_for(
 					target.evaluate(
 						"""el => {
-							const t = el.closest('a,[role="link"],button,[role="button"]') || el;
-							t.scrollIntoView({block:'center'});
-							t.click();
+							const t = el.closest('a,[role="link"],button,[role="button"],label') || el;
+							if (t.scrollIntoView) t.scrollIntoView({block:'center'});
+							if (typeof t.click === 'function') { t.click(); return; }
+							t.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
 						}"""
 					),
 					timeout=3.0,
 				)
-				self.logger.info(f'🖱️ (BiDi) JS-clicked {element_node.node_name} after actionability timeout')
+				self.logger.info(f'🖱️ (BiDi) JS-clicked {element_node.node_name} after force-click failed')
 				return None
-			except Exception as e2:
-				self.logger.error(f'[DefaultActionWatchdog] (BiDi) click failed (normal: {e1}; js: {e2})')
+			except Exception as e3:
+				self.logger.error(f'[DefaultActionWatchdog] (BiDi) click failed (normal: {e1}; js: {e3})')
 				raise
 
 	async def _on_type_text_bidi(self, event):
