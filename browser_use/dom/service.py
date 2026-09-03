@@ -1182,7 +1182,7 @@ class DomService:
 			'a','button','input','textarea','select','option','label',
 			'details','summary','video','audio','iframe',
 		]);
-		let counter = 0;
+		if (typeof window.__buNext !== 'number') window.__buNext = 0;
 
 		function rect(el) {
 			try {
@@ -1250,8 +1250,11 @@ class DomService:
 		function walk(node, parentId, depth) {
 			if (!node) return;
 			if (depth > 200) return;  // sane recursion limit
-			counter += 1;
-			const myId = counter;
+			// Plant el.__buid so act-path resolvers (query by backendNodeId)
+			// can find the same live element the observe walk just numbered.
+			const myId = (node.nodeType === 1)
+				? (node.__buid || (node.__buid = ++window.__buNext))
+				: ++window.__buNext;
 			let entry;
 			if (node.nodeType === 3) {  // TEXT
 				const txt = (node.textContent || '').trim();
