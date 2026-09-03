@@ -186,6 +186,9 @@ class BidiBrowserConnection(BrowserConnection):
 		# connect to a remote Camoufox over the ws, Playwright Firefox honours a
 		# proxy passed to new_context(). dict form: {server, username, password, bypass}.
 		self._proxy = proxy
+		# Injected browsers are owned by the host (e.g. a Camoufox singleton) —
+		# stop() must not close page/context/browser/playwright.
+		self._external_browser = browser is not None
 		self._owns_playwright = playwright is None and browser is None
 		self._started = browser is not None
 		# Default context + page — populated by start(). Single-tab posture
@@ -238,6 +241,15 @@ class BidiBrowserConnection(BrowserConnection):
 		self._started = True
 
 	async def stop(self) -> None:
+		# External/shared browsers: drop refs only — host owns lifecycle.
+		if self._external_browser:
+			self._page = None
+			self._context = None
+			self._browser = None
+			self._playwright = None
+			self._started = False
+			return
+
 		# Order: page → context → browser → playwright runtime. Each step
 		# is best-effort and never raises. We close the context only when
 		# we created it (i.e. when starting from a fresh Browser without
