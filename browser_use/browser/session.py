@@ -1893,6 +1893,7 @@ class BrowserSession(BaseModel):
 
 		if self.browser_profile.browser_type == BrowserType.FIREFOX:
 			from browser_use.browser.connection import BidiBrowserConnection
+			from browser_use.browser.shared_browser import get_shared_browser
 
 			ws_url = cdp_url or self.cdp_url
 			if not ws_url:
@@ -1910,7 +1911,21 @@ class BrowserSession(BaseModel):
 					_proxy_dict = _p.model_dump(exclude_none=True) if hasattr(_p, 'model_dump') else dict(_p)
 				except Exception:
 					_proxy_dict = None
-			self._connection = BidiBrowserConnection(ws_endpoint=ws_url, proxy=_proxy_dict)
+			# Prefer a host-registered shared browser (same Playwright WS
+			# connection → same contexts/pages). A fresh firefox.connect()
+			# would see zero contexts and land on about:blank.
+			_shared = get_shared_browser()
+			if _shared is not None:
+				_pw, _br = _shared
+				self._connection = BidiBrowserConnection(
+					browser=_br,
+					playwright=_pw,
+					ws_endpoint=ws_url,
+					proxy=_proxy_dict,
+				)
+				self.logger.info('🦊 Reusing shared Playwright Firefox browser for BiDi session')
+			else:
+				self._connection = BidiBrowserConnection(ws_endpoint=ws_url, proxy=_proxy_dict)
 			await self._connection.start()
 			# Phase-5 facade: stand up the CDP→Playwright proxy so the
 			# raw `cdp_client.send.*` call sites in the watchdogs + dom/service
